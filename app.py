@@ -2,90 +2,117 @@
 app.py
 Streamlit frontend for the Crop Yield Prediction System.
 
-Talks to the FastAPI backend (api.py) over HTTP. Start the API first:
-    uvicorn api:app --reload --port 8000
-Then run this app:
-    streamlit run app.py
+DEPLOYMENT NOTE:
+This version is self-contained -- it loads the trained pipeline directly
+(no separate FastAPI process needed), which is required for platforms
+like Streamlit Community Cloud that only run a single process.
 
-Set the API_URL environment variable if the API is not on localhost:8000.
+If no trained model is found in models/, it trains one automatically on
+first load (cached, so this only happens once per app instance).
+
+For local development, you can still run api.py separately as a REST
+backend for other clients -- see api.py.
+
+Run with:
+    streamlit run app.py
 """
 
+import json
 import os
 
+import joblib
 import pandas as pd
-import requests
 import streamlit as st
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
 
 import config
-
-API_URL = os.environ.get("API_URL", "http://localhost:8000")
+from train import (
+    build_models,
+    build_preprocessor,
+    evaluate,
+    generate_synthetic_dataset,
+    get_feature_importance,
+)
 
 st.set_page_config(page_title="Crop Yield Prediction", page_icon="🌾", layout="wide")
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Load (or train, if missing) the model -- cached so it only happens once
 # ---------------------------------------------------------------------------
-@st.cache_data(ttl=30)
-def check_health():
-    try:
-        r = requests.get(f"{API_URL}/health", timeout=5)
-        r.raise_for_status()
-        return r.json()
-    except Exception:
-        return None
+@st.cache_resource(show_spinner="Preparing model (first run trains it, ~30-90s)...")
+def load_or_train():
+    if os.path.exists(config.PIPELINE_PATH) and os.path.exists(config.METRICS_PATH):
+        pipeline = joblib.load(config.PIPELINE_PATH)
+        with open(config.METRICS_PATH) as f:
+            metrics = json.load(f)
+        return pipeline, metrics
+
+    # No saved model found (e.g. fresh deploy with no models/ committed) -- train now.
+    df = generate_synthetic_dataset(n_samples=5000)
+    X, y = df[config.ALL_FEATURES], df[config.TARGET]
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=config.RANDOM_STATE
+    )
+
+    results, fitted = {}, {}
+    for name, model in build_models().items():
+        pipe = Pipeline(steps=[("preprocessor", build_preprocessor()), ("model", model)])
+        pipe.fit(X_train, y_train)
+        results[name] = evaluate(y_test, pipe.predict(X_test))
+        fitted[name] = pipe
+
+    best_name = min(results, key=lambda k: results[k]["rmse"])
+    best_pipeline = fitted[best_name]
+
+    os.makedirs(config.MODEL_DIR, exist_ok=True)
+    joblib.dump(best_pipeline, config.PIPELINE_PATH)
+
+    metrics = {
+        "best_model": best_name,
+        "all_models": results,
+        "trained_on_rows": len(df),
+        "features": config.ALL_FEATURES,
+        "target": config.TARGET,
+    }
+    with open(config.METRICS_PATH, "w") as f:
+        json.dump(metrics, f, indent=2)
+
+    importance = get_feature_importance(best_pipeline)
+    with open(config.FEATURE_IMPORTANCE_PATH, "w") as f:
+        json.dump(importance, f, indent=2)
+
+    return best_pipeline, metrics
 
 
-@st.cache_data(ttl=30)
-def get_model_info():
-    try:
-        r = requests.get(f"{API_URL}/model-info", timeout=5)
-        r.raise_for_status()
-        return r.json()
-    except Exception:
-        return None
+@st.cache_resource
+def load_feature_importance():
+    if os.path.exists(config.FEATURE_IMPORTANCE_PATH):
+        with open(config.FEATURE_IMPORTANCE_PATH) as f:
+            return json.load(f)
+    return {}
 
 
-@st.cache_data(ttl=30)
-def get_feature_importance():
-    try:
-        r = requests.get(f"{API_URL}/feature-importance", timeout=5)
-        r.raise_for_status()
-        return r.json()
-    except Exception:
-        return None
+pipeline, metrics_info = load_or_train()
+importance_info = load_feature_importance()
 
 
-def call_predict(payload: dict):
-    r = requests.post(f"{API_URL}/predict", json=payload, timeout=10)
-    r.raise_for_status()
-    return r.json()
+def predict_one(payload: dict) -> float:
+    df = pd.DataFrame([payload])[config.ALL_FEATURES]
+    return round(float(pipeline.predict(df)[0]), 3)
 
 
-def call_predict_batch(records: list):
-    r = requests.post(f"{API_URL}/predict/batch", json={"records": records}, timeout=30)
-    r.raise_for_status()
-    return r.json()
+def predict_many(df: pd.DataFrame) -> list:
+    return [round(float(p), 3) for p in pipeline.predict(df[config.ALL_FEATURES])]
 
 
 # ---------------------------------------------------------------------------
-# Header + connection status
+# Header
 # ---------------------------------------------------------------------------
 st.title("🌾 Crop Yield Prediction System")
 st.caption("Predict expected crop production from weather and soil information.")
-
-health = check_health()
-if health is None:
-    st.error(
-        f"Can't reach the API at `{API_URL}`. Start it with `uvicorn api:app --reload --port 8000`, "
-        "or set the API_URL environment variable."
-    )
-    st.stop()
-elif not health.get("model_loaded"):
-    st.warning("API is running but no trained model is loaded. Run `python train.py` first, then restart the API.")
-    st.stop()
-else:
-    st.success(f"Connected to API at `{API_URL}`")
+st.success(f"Model ready -- using **{metrics_info['best_model']}**")
 
 tab_single, tab_batch, tab_model = st.tabs(["Single Prediction", "Batch Prediction (CSV)", "Model Info"])
 
@@ -134,14 +161,12 @@ with tab_single:
             "season": season,
         }
         try:
-            result = call_predict(payload)
+            pred = predict_one(payload)
             st.metric(
-                label=f"Predicted Yield — {crop_type} ({region}, {season})",
-                value=f"{result['predicted_yield_tons_per_ha']} t/ha",
+                label=f"Predicted Yield -- {crop_type} ({region}, {season})",
+                value=f"{pred} t/ha",
             )
-            st.caption(f"Model used: {result['model_used']}")
-        except requests.HTTPError as e:
-            st.error(f"Prediction failed: {e.response.text}")
+            st.caption(f"Model used: {metrics_info['best_model']}")
         except Exception as e:
             st.error(f"Prediction failed: {e}")
 
@@ -150,10 +175,7 @@ with tab_single:
 # ---------------------------------------------------------------------------
 with tab_batch:
     st.subheader("Batch prediction from CSV")
-    st.write(
-        "Upload a CSV with these columns: "
-        f"`{', '.join(config.ALL_FEATURES)}`"
-    )
+    st.write(f"Upload a CSV with these columns: `{', '.join(config.ALL_FEATURES)}`")
     uploaded = st.file_uploader("Choose a CSV file", type=["csv"])
 
     if uploaded is not None:
@@ -164,12 +186,10 @@ with tab_batch:
         else:
             st.dataframe(df.head(), use_container_width=True)
             if st.button("Run batch prediction", type="primary"):
-                records = df[config.ALL_FEATURES].to_dict(orient="records")
                 try:
-                    result = call_predict_batch(records)
                     df_out = df.copy()
-                    df_out["predicted_yield_tons_per_ha"] = result["predictions"]
-                    st.success(f"Predicted {len(df_out)} rows using {result['model_used']}.")
+                    df_out["predicted_yield_tons_per_ha"] = predict_many(df)
+                    st.success(f"Predicted {len(df_out)} rows using {metrics_info['best_model']}.")
                     st.dataframe(df_out, use_container_width=True)
                     st.download_button(
                         "Download results as CSV",
@@ -177,8 +197,6 @@ with tab_batch:
                         file_name="crop_yield_predictions.csv",
                         mime="text/csv",
                     )
-                except requests.HTTPError as e:
-                    st.error(f"Batch prediction failed: {e.response.text}")
                 except Exception as e:
                     st.error(f"Batch prediction failed: {e}")
 
@@ -187,19 +205,14 @@ with tab_batch:
 # ---------------------------------------------------------------------------
 with tab_model:
     st.subheader("Model comparison & metrics")
-    info = get_model_info()
-    if info is None:
-        st.info("No model metrics available yet. Run `python train.py`.")
-    else:
-        st.write(f"**Best model in production:** {info['best_model']}")
-        metrics_df = pd.DataFrame(info["all_models"]).T
-        st.dataframe(metrics_df, use_container_width=True)
-        st.caption(f"Trained on {info['trained_on_rows']} rows.")
+    st.write(f"**Best model in production:** {metrics_info['best_model']}")
+    metrics_df = pd.DataFrame(metrics_info["all_models"]).T
+    st.dataframe(metrics_df, use_container_width=True)
+    st.caption(f"Trained on {metrics_info['trained_on_rows']} rows.")
 
     st.subheader("Feature importance")
-    importance = get_feature_importance()
-    if importance:
-        imp_df = pd.DataFrame(list(importance.items()), columns=["feature", "importance"]).head(15)
+    if importance_info:
+        imp_df = pd.DataFrame(list(importance_info.items()), columns=["feature", "importance"]).head(15)
         st.bar_chart(imp_df.set_index("feature"))
     else:
         st.info("No feature importance available yet.")
