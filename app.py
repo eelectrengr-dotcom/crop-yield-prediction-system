@@ -2,19 +2,20 @@
 app.py
 Streamlit frontend for the Crop Yield Prediction System.
 
-DEPLOYMENT NOTE:
-This version is self-contained -- it loads the trained pipeline directly
-(no separate FastAPI process needed), which is required for platforms
-like Streamlit Community Cloud that only run a single process.
+Two modes, controlled automatically by whether API_URL is configured:
 
-If no trained model is found in models/, it trains one automatically on
-first load (cached, so this only happens once per app instance).
+1. API MODE (Streamlit + FastAPI, matches the assignment spec):
+   Set an API_URL secret/env var pointing at your deployed api.py
+   (e.g. a Render URL). The app calls it over HTTP for every prediction.
 
-For local development, you can still run api.py separately as a REST
-backend for other clients -- see api.py.
+2. STANDALONE MODE (fallback, no separate backend needed):
+   If API_URL isn't set, the app loads/trains the model directly in-process.
+   This keeps the app usable even without a hosted API.
 
-Run with:
-    streamlit run app.py
+Local dev:
+    uvicorn api:app --reload --port 8000      # terminal 1
+    API_URL=http://localhost:8000 streamlit run app.py   # terminal 2 (API mode)
+    streamlit run app.py                                 # or just this (standalone mode)
 """
 
 import json
@@ -22,6 +23,7 @@ import os
 
 import joblib
 import pandas as pd
+import requests
 import streamlit as st
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
@@ -37,9 +39,19 @@ from train import (
 
 st.set_page_config(page_title="Crop Yield Prediction", page_icon="🌾", layout="wide")
 
+# API_URL can come from an environment variable (local dev) or Streamlit secrets (cloud deploy).
+API_URL = os.environ.get("API_URL") or st.secrets.get("API_URL", None) if hasattr(st, "secrets") else os.environ.get("API_URL")
+try:
+    if not API_URL and "API_URL" in st.secrets:
+        API_URL = st.secrets["API_URL"]
+except Exception:
+    pass
+
+USE_API = bool(API_URL)
+
 
 # ---------------------------------------------------------------------------
-# Load (or train, if missing) the model -- cached so it only happens once
+# STANDALONE MODE: load or train the model directly in-process
 # ---------------------------------------------------------------------------
 @st.cache_resource(show_spinner="Preparing model (first run trains it, ~30-90s)...")
 def load_or_train():
@@ -49,7 +61,6 @@ def load_or_train():
             metrics = json.load(f)
         return pipeline, metrics
 
-    # No saved model found (e.g. fresh deploy with no models/ committed) -- train now.
     df = generate_synthetic_dataset(n_samples=5000)
     X, y = df[config.ALL_FEATURES], df[config.TARGET]
     X_train, X_test, y_train, y_test = train_test_split(
@@ -87,24 +98,92 @@ def load_or_train():
 
 
 @st.cache_resource
-def load_feature_importance():
+def load_feature_importance_local():
     if os.path.exists(config.FEATURE_IMPORTANCE_PATH):
         with open(config.FEATURE_IMPORTANCE_PATH) as f:
             return json.load(f)
     return {}
 
 
-pipeline, metrics_info = load_or_train()
-importance_info = load_feature_importance()
+# ---------------------------------------------------------------------------
+# API MODE: talk to the deployed FastAPI backend
+# ---------------------------------------------------------------------------
+@st.cache_data(ttl=30)
+def api_health():
+    try:
+        r = requests.get(f"{API_URL}/health", timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return None
 
 
-def predict_one(payload: dict) -> float:
-    df = pd.DataFrame([payload])[config.ALL_FEATURES]
-    return round(float(pipeline.predict(df)[0]), 3)
+@st.cache_data(ttl=60)
+def api_model_info():
+    try:
+        r = requests.get(f"{API_URL}/model-info", timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return None
 
 
-def predict_many(df: pd.DataFrame) -> list:
-    return [round(float(p), 3) for p in pipeline.predict(df[config.ALL_FEATURES])]
+@st.cache_data(ttl=60)
+def api_feature_importance():
+    try:
+        r = requests.get(f"{API_URL}/feature-importance", timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return None
+
+
+def api_predict(payload: dict) -> dict:
+    r = requests.post(f"{API_URL}/predict", json=payload, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+
+def api_predict_batch(records: list) -> dict:
+    r = requests.post(f"{API_URL}/predict/batch", json={"records": records}, timeout=60)
+    r.raise_for_status()
+    return r.json()
+
+
+# ---------------------------------------------------------------------------
+# Unified interface used by the UI below
+# ---------------------------------------------------------------------------
+if USE_API:
+    health = api_health()
+    if health is None or not health.get("model_loaded"):
+        st.warning(
+            f"Configured to use the API at `{API_URL}` but it isn't responding yet "
+            "(free hosts can take ~30-60s to wake up from a cold start). Retry in a moment, "
+            "or the app will fall back to standalone mode below."
+        )
+        USE_API = False
+
+if USE_API:
+    metrics_info = api_model_info() or {}
+    importance_info = api_feature_importance() or {}
+
+    def predict_one(payload: dict) -> float:
+        return api_predict(payload)["predicted_yield_tons_per_ha"]
+
+    def predict_many(df: pd.DataFrame) -> list:
+        records = df[config.ALL_FEATURES].to_dict(orient="records")
+        return api_predict_batch(records)["predictions"]
+
+else:
+    pipeline, metrics_info = load_or_train()
+    importance_info = load_feature_importance_local()
+
+    def predict_one(payload: dict) -> float:
+        df = pd.DataFrame([payload])[config.ALL_FEATURES]
+        return round(float(pipeline.predict(df)[0]), 3)
+
+    def predict_many(df: pd.DataFrame) -> list:
+        return [round(float(p), 3) for p in pipeline.predict(df[config.ALL_FEATURES])]
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +191,11 @@ def predict_many(df: pd.DataFrame) -> list:
 # ---------------------------------------------------------------------------
 st.title("🌾 Crop Yield Prediction System")
 st.caption("Predict expected crop production from weather and soil information.")
-st.success(f"Model ready -- using **{metrics_info['best_model']}**")
+
+if USE_API:
+    st.success(f"Connected to FastAPI backend at `{API_URL}` — using **{metrics_info.get('best_model', '?')}**")
+else:
+    st.success(f"Standalone mode — using **{metrics_info.get('best_model', '?')}**")
 
 tab_single, tab_batch, tab_model = st.tabs(["Single Prediction", "Batch Prediction (CSV)", "Model Info"])
 
@@ -163,10 +246,10 @@ with tab_single:
         try:
             pred = predict_one(payload)
             st.metric(
-                label=f"Predicted Yield -- {crop_type} ({region}, {season})",
+                label=f"Predicted Yield — {crop_type} ({region}, {season})",
                 value=f"{pred} t/ha",
             )
-            st.caption(f"Model used: {metrics_info['best_model']}")
+            st.caption(f"Model used: {metrics_info.get('best_model', '?')}")
         except Exception as e:
             st.error(f"Prediction failed: {e}")
 
@@ -189,7 +272,7 @@ with tab_batch:
                 try:
                     df_out = df.copy()
                     df_out["predicted_yield_tons_per_ha"] = predict_many(df)
-                    st.success(f"Predicted {len(df_out)} rows using {metrics_info['best_model']}.")
+                    st.success(f"Predicted {len(df_out)} rows using {metrics_info.get('best_model', '?')}.")
                     st.dataframe(df_out, use_container_width=True)
                     st.download_button(
                         "Download results as CSV",
@@ -205,10 +288,14 @@ with tab_batch:
 # ---------------------------------------------------------------------------
 with tab_model:
     st.subheader("Model comparison & metrics")
-    st.write(f"**Best model in production:** {metrics_info['best_model']}")
-    metrics_df = pd.DataFrame(metrics_info["all_models"]).T
-    st.dataframe(metrics_df, use_container_width=True)
-    st.caption(f"Trained on {metrics_info['trained_on_rows']} rows.")
+    if metrics_info:
+        st.write(f"**Best model in production:** {metrics_info.get('best_model', '?')}")
+        if "all_models" in metrics_info:
+            metrics_df = pd.DataFrame(metrics_info["all_models"]).T
+            st.dataframe(metrics_df, use_container_width=True)
+        st.caption(f"Trained on {metrics_info.get('trained_on_rows', '?')} rows.")
+    else:
+        st.info("No model metrics available yet.")
 
     st.subheader("Feature importance")
     if importance_info:
