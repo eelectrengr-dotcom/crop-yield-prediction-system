@@ -33,24 +33,61 @@ import config
 ml_artifacts = {"pipeline": None, "metrics": None, "importance": None}
 
 
+def _train_and_save():
+    """Train fresh (used when no saved pipeline exists yet, e.g. a clean
+    deploy on a host like Render where models/ wasn't committed to git)."""
+    from sklearn.model_selection import train_test_split
+    from sklearn.pipeline import Pipeline
+    from train import build_models, build_preprocessor, evaluate, generate_synthetic_dataset, get_feature_importance
+
+    print("No saved pipeline found -- training a fresh one now (one-time, ~30-90s)...")
+    df = generate_synthetic_dataset(n_samples=5000)
+    X, y = df[config.ALL_FEATURES], df[config.TARGET]
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=config.RANDOM_STATE)
+
+    results, fitted = {}, {}
+    for name, model in build_models().items():
+        pipe = Pipeline(steps=[("preprocessor", build_preprocessor()), ("model", model)])
+        pipe.fit(X_train, y_train)
+        results[name] = evaluate(y_test, pipe.predict(X_test))
+        fitted[name] = pipe
+
+    best_name = min(results, key=lambda k: results[k]["rmse"])
+    best_pipeline = fitted[best_name]
+
+    joblib.dump(best_pipeline, config.PIPELINE_PATH)
+    metrics = {
+        "best_model": best_name,
+        "all_models": results,
+        "trained_on_rows": len(df),
+        "features": config.ALL_FEATURES,
+        "target": config.TARGET,
+    }
+    with open(config.METRICS_PATH, "w") as f:
+        json.dump(metrics, f, indent=2)
+    importance = get_feature_importance(best_pipeline)
+    with open(config.FEATURE_IMPORTANCE_PATH, "w") as f:
+        json.dump(importance, f, indent=2)
+    print(f"Trained and saved pipeline -- best model: {best_name}")
+    return best_pipeline, metrics, importance
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    if not os.path.exists(config.PIPELINE_PATH):
-        print(
-            f"WARNING: no trained pipeline found at {config.PIPELINE_PATH}. "
-            "Run `python train.py` first. The API will start but /predict will fail."
-        )
-    else:
+    if os.path.exists(config.PIPELINE_PATH):
         ml_artifacts["pipeline"] = joblib.load(config.PIPELINE_PATH)
         print(f"Loaded pipeline from {config.PIPELINE_PATH}")
-
-    if os.path.exists(config.METRICS_PATH):
-        with open(config.METRICS_PATH) as f:
-            ml_artifacts["metrics"] = json.load(f)
-
-    if os.path.exists(config.FEATURE_IMPORTANCE_PATH):
-        with open(config.FEATURE_IMPORTANCE_PATH) as f:
-            ml_artifacts["importance"] = json.load(f)
+        if os.path.exists(config.METRICS_PATH):
+            with open(config.METRICS_PATH) as f:
+                ml_artifacts["metrics"] = json.load(f)
+        if os.path.exists(config.FEATURE_IMPORTANCE_PATH):
+            with open(config.FEATURE_IMPORTANCE_PATH) as f:
+                ml_artifacts["importance"] = json.load(f)
+    else:
+        pipeline, metrics, importance = _train_and_save()
+        ml_artifacts["pipeline"] = pipeline
+        ml_artifacts["metrics"] = metrics
+        ml_artifacts["importance"] = importance
 
     yield
     ml_artifacts.clear()
