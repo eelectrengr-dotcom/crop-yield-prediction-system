@@ -127,8 +127,58 @@ All of this lives in one place — `config.py` — so `train.py`, `api.py`, and 
 
 `train.py` ships with a synthetic data generator so the whole pipeline runs end-to-end with zero setup. The relationships are hand-crafted to be agronomically plausible (yield peaks at a crop-specific optimal temperature, responds to rainfall/nutrients with diminishing returns, etc.) rather than pure noise, so the models have a real signal to learn. **Swap in real agricultural data** (e.g., from your local agriculture department or a Kaggle crop-yield dataset) by passing `--data your_file.csv` with matching columns for production use.
 
-## 8. Troubleshooting
+## 9. Deploying: Streamlit + FastAPI (both live, as intended)
 
-- **Streamlit says "Can't reach the API"** → make sure `uvicorn api:app --reload --port 8000` is running in another terminal.
-- **API says "Model is not loaded"** → run `python train.py` first; it must be run before starting the API (or restart the API after training).
+`app.py` supports two modes, chosen automatically:
+- **API mode** — if an `API_URL` is configured, it calls your deployed FastAPI backend for every prediction (this is the "Streamlit + FastAPI" setup).
+- **Standalone mode** — if `API_URL` isn't set (or the API is unreachable), it loads/trains the model directly, so the app still works with zero backend.
+
+To get the real two-service deployment running:
+
+### 9.1 Push to GitHub
+
+```bash
+cd "Crop Yield Prediction System"
+git init
+git add .
+git commit -m "Initial commit: crop yield prediction system"
+git branch -M main
+git remote add origin https://github.com/<your-username>/<your-repo-name>.git
+git push -u origin main
+```
+
+### 9.2 Deploy the FastAPI backend on Render (free tier)
+
+1. Go to **https://render.com**, sign in with GitHub.
+2. Click **New +** → **Web Service** → select your repo.
+3. Set:
+   - **Build Command:** `pip install -r requirements-api.txt`
+   - **Start Command:** `uvicorn api:app --host 0.0.0.0 --port $PORT`
+4. Click **Create Web Service** and wait for it to deploy.
+5. Once live, note the URL Render gives you, e.g. `https://your-app.onrender.com`. Visit `https://your-app.onrender.com/health` to confirm it responds — the first request may take ~30-90s since `api.py` trains a model on first startup (no `models/` folder is committed to git).
+
+**Note:** Render's free tier spins the service down after ~15 minutes of no traffic, and cold-starts take 30-60s on the next request. That's normal for a free-tier demo.
+
+### 9.3 Deploy the Streamlit frontend
+
+1. Go to **https://share.streamlit.io**, sign in with GitHub.
+2. Click **New app**, select your repo/branch, set **Main file path** to `app.py`, and deploy.
+3. Once deployed, open **Manage app** → **Settings** → **Secrets**, and add:
+   ```
+   API_URL = "https://your-app.onrender.com"
+   ```
+4. Save — the app restarts automatically and will now show **"Connected to FastAPI backend at ..."** and route every prediction through your live API.
+
+### 9.4 Verify
+
+- Deployed Streamlit app header should say *"Connected to FastAPI backend at `https://your-app.onrender.com`"*.
+- Make a prediction — it's now served by the deployed FastAPI, not computed in-process.
+- If Render's free instance has gone to sleep, you may briefly see a fallback warning and standalone mode kick in — refresh after a few seconds once Render wakes back up.
+
+## 10. Troubleshooting
+
+- **Streamlit can't load a model in standalone mode** → run `python train.py` first, or let it auto-train on first load.
+- **`api.py` says "Model is not loaded" locally** → run `python train.py` first, or just start the API — it now auto-trains if no model file exists.
 - **LightGBM install issues on macOS** → you may need `brew install libomp` first.
+- **pip fails building pandas/numpy from source on Windows** → use the `>=` version ranges already in `requirements.txt` (not exact pins) so pip picks a version with a prebuilt wheel for your Python version; avoid Python 3.13+ if wheels aren't yet available for it.
+- **Streamlit app stuck showing the API warning** → Render's free tier sleeps after inactivity; give it ~30-60s and refresh, or check the Render dashboard to confirm the service is running.
